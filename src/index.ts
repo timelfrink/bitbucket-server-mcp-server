@@ -30,6 +30,8 @@ interface BitbucketConfig {
   username?: string;
   password?: string;
   defaultProject?: string;
+  maxLinesPerFile?: number;
+  readOnly?: boolean;
 }
 
 interface RepositoryParams {
@@ -106,7 +108,11 @@ class BitbucketServer {
       token: process.env.BITBUCKET_TOKEN,
       username: process.env.BITBUCKET_USERNAME,
       password: process.env.BITBUCKET_PASSWORD,
-      defaultProject: process.env.BITBUCKET_DEFAULT_PROJECT
+      defaultProject: process.env.BITBUCKET_DEFAULT_PROJECT,
+      maxLinesPerFile: process.env.BITBUCKET_DIFF_MAX_LINES_PER_FILE 
+        ? parseInt(process.env.BITBUCKET_DIFF_MAX_LINES_PER_FILE, 10) 
+        : undefined,
+      readOnly: process.env.BITBUCKET_READ_ONLY === 'true'
     };
 
     if (!this.config.baseUrl) {
@@ -147,6 +153,8 @@ class BitbucketServer {
   }
 
   private setupToolHandlers() {
+    const readOnlyTools = ['list_projects', 'list_repositories', 'get_pull_request', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository'];
+    
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
@@ -263,7 +271,8 @@ class BitbucketServer {
               project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
               repository: { type: 'string', description: 'Repository slug containing the pull request.' },
               prId: { type: 'number', description: 'Pull request ID to get diff for.' },
-              contextLines: { type: 'number', description: 'Number of context lines to show around changes (default: 10). Higher values provide more surrounding code context.' }
+              contextLines: { type: 'number', description: 'Number of context lines to show around changes (default: 10). Higher values provide more surrounding code context.' },
+              maxLinesPerFile: { type: 'number', description: 'Maximum number of lines to show per file (default: uses BITBUCKET_DIFF_MAX_LINES_PER_FILE env var). Set to 0 for no limit. Prevents large files from overwhelming the diff output.' }
             },
             required: ['repository', 'prId']
           }
@@ -358,13 +367,21 @@ class BitbucketServer {
             required: ['repository']
           }
         }
-      ]
+      ].filter(tool => !this.config.readOnly || readOnlyTools.includes(tool.name))
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       try {
         logger.info(`Called tool: ${request.params.name}`, { arguments: request.params.arguments });
         const args = request.params.arguments ?? {};
+
+        // Check if tool is allowed in read-only mode
+        if (this.config.readOnly && !readOnlyTools.includes(request.params.name)) {
+          throw new McpError(
+            ErrorCode.MethodNotFound,
+            `Tool ${request.params.name} is not available in read-only mode`
+          );
+        }
 
         // Helper function to get project with fallback to default
         const getProject = (providedProject?: string): string => {
@@ -454,7 +471,11 @@ class BitbucketServer {
               repository: args.repository as string,
               prId: args.prId as number
             };
-            return await this.getDiff(diffPrParams, args.contextLines as number);
+            return await this.getDiff(
+              diffPrParams, 
+              args.contextLines as number, 
+              args.maxLinesPerFile as number
+            );
           }
 
           case 'get_reviews': {
@@ -733,7 +754,97 @@ class BitbucketServer {
     };
   }
 
-  private async getDiff(params: PullRequestParams, contextLines: number = 10) {
+  private truncateDiff(diffContent: string, maxLinesPerFile: number): string {
+    if (!maxLinesPerFile || maxLinesPerFile <= 0) {
+      return diffContent;
+    }
+
+    const lines = diffContent.split('\n');
+    const result: string[] = [];
+    let currentFileLines: string[] = [];
+    let currentFileName = '';
+    let inFileContent = false;
+
+    for (const line of lines) {
+      // Detect file headers (diff --git, index, +++, ---)
+      if (line.startsWith('diff --git ')) {
+        // Process previous file if any
+        if (currentFileLines.length > 0) {
+          result.push(...this.truncateFileSection(currentFileLines, currentFileName, maxLinesPerFile));
+          currentFileLines = [];
+        }
+        
+        // Extract filename for context
+        const match = line.match(/diff --git a\/(.+) b\/(.+)/);
+        currentFileName = match ? match[2] : 'unknown';
+        inFileContent = false;
+        
+        // Always include file headers
+        result.push(line);
+      } else if (line.startsWith('index ') || line.startsWith('+++') || line.startsWith('---')) {
+        // Always include file metadata
+        result.push(line);
+      } else if (line.startsWith('@@')) {
+        // Hunk header - marks start of actual file content
+        inFileContent = true;
+        currentFileLines.push(line);
+      } else if (inFileContent) {
+        // Collect file content lines for potential truncation
+        currentFileLines.push(line);
+      } else {
+        // Other lines (empty lines between files, etc.)
+        result.push(line);
+      }
+    }
+
+    // Process the last file
+    if (currentFileLines.length > 0) {
+      result.push(...this.truncateFileSection(currentFileLines, currentFileName, maxLinesPerFile));
+    }
+
+    return result.join('\n');
+  }
+
+  private truncateFileSection(fileLines: string[], fileName: string, maxLines: number): string[] {
+    if (fileLines.length <= maxLines) {
+      return fileLines;
+    }
+
+    // Count actual content lines (excluding hunk headers)
+    const contentLines = fileLines.filter(line => !line.startsWith('@@'));
+    const hunkHeaders = fileLines.filter(line => line.startsWith('@@'));
+
+    if (contentLines.length <= maxLines) {
+      return fileLines; // No need to truncate if content is within limit
+    }
+
+    // Smart truncation: show beginning and end
+    const showAtStart = Math.floor(maxLines * 0.6); // 60% at start
+    const showAtEnd = Math.floor(maxLines * 0.4);   // 40% at end
+    const truncatedCount = contentLines.length - showAtStart - showAtEnd;
+
+    const result: string[] = [];
+    
+    // Add hunk headers first
+    result.push(...hunkHeaders);
+    
+    // Add first portion
+    result.push(...contentLines.slice(0, showAtStart));
+    
+    // Add truncation message
+    result.push('');
+    result.push(`[*** FILE TRUNCATED: ${truncatedCount} lines hidden from ${fileName} ***]`);
+    result.push(`[*** File had ${contentLines.length} total lines, showing first ${showAtStart} and last ${showAtEnd} ***]`);
+    result.push(`[*** Use maxLinesPerFile=0 to see complete diff ***]`);
+    result.push('');
+    
+    // Add last portion
+    result.push(...contentLines.slice(-showAtEnd));
+
+    return result;
+  }
+
+  private async getDiff(params: PullRequestParams, contextLines: number = 10, maxLinesPerFile?: number) {
     const { project, repository, prId } = params;
     
     if (!project || !repository || !prId) {
@@ -751,8 +862,17 @@ class BitbucketServer {
       }
     );
 
+    // Determine max lines per file: parameter > env var > no limit
+    const effectiveMaxLines = maxLinesPerFile !== undefined 
+      ? maxLinesPerFile 
+      : this.config.maxLinesPerFile;
+
+    const diffContent = effectiveMaxLines 
+      ? this.truncateDiff(response.data, effectiveMaxLines)
+      : response.data;
+
     return {
-      content: [{ type: 'text', text: response.data }]
+      content: [{ type: 'text', text: diffContent }]
     };
   }
 
